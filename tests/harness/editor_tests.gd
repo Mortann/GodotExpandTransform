@@ -199,6 +199,7 @@ func _run() -> void:
 		_check(cube.transform.is_finite(), "B rotate/scale remains finite mode %s" % mode)
 		plugin._cancel()
 	await _test_real_input()
+	await _test_csg_workflow()
 	print("EDITOR_TESTS: %d checks, %d failures" % [checks, failures])
 	get_tree().quit(1 if failures > 0 else 0)
 
@@ -303,3 +304,127 @@ func _click(surface: Control) -> void:
 		event.global_position = event.position
 		Input.parse_input_event(event)
 		await get_tree().process_frame
+
+
+func _test_csg_workflow() -> void:
+	cube.hide()
+	other.hide()
+	var old_parent: Node3D = scene.get_node("Parent_Tourne_Echelle_Non_Uniforme")
+	old_parent.hide()
+	var source := CSGBox3D.new()
+	source.name = "CSG_Source"
+	source.size = Vector3.ONE * 2
+	scene.add_child(source)
+	source.owner = scene
+	source.position = Vector3(-2.5, 1, 0)
+	var target := CSGBox3D.new()
+	target.name = "CSG_Cible"
+	target.size = Vector3.ONE * 2
+	scene.add_child(target)
+	target.owner = scene
+	target.position = Vector3(2.5, 1, 0)
+	for i in 4:
+		await get_tree().process_frame
+	_select([source])
+	EditorInterface.edit_node(source)
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	var surface: Control
+	for sibling in viewport.get_parent().get_parent().get_children(true):
+		if sibling is Control and sibling.focus_mode == Control.FOCUS_ALL:
+			surface = sibling
+			break
+	_check(surface != null, "CSG test viewport surface available")
+	if surface == null:
+		return
+	surface.grab_focus()
+	await get_tree().process_frame
+	Input.parse_input_event(_key(KEY_G))
+	await get_tree().process_frame
+	Input.parse_input_event(_key(KEY_B))
+	for i in 4:
+		await get_tree().process_frame
+	_check(plugin._pick_base and not plugin._building_snap, "B prepares CSG snapping")
+	# Hide the panel through an actual toolbar click while B is active.
+	plugin._panel_toggle.button_pressed = true
+	for pressed in [true, false]:
+		var button := InputEventMouseButton.new()
+		button.button_index = MOUSE_BUTTON_LEFT
+		button.pressed = pressed
+		button.position = plugin._panel_toggle.get_global_rect().get_center()
+		button.global_position = button.position
+		Input.parse_input_event(button)
+		await get_tree().process_frame
+	_check(not plugin._show_panel and plugin._pick_base, "toolbar hides panel without cancelling B")
+	_check(EditorInterface.get_editor_settings().get_project_metadata("blender_controls", "show_panel", true) == false, "panel visibility persisted")
+	var signs := (camera.global_position - source.global_position).sign()
+	var vertex := source.global_position + signs
+	var edge := source.global_position + Vector3(signs.x, 0, signs.z)
+	var facing := camera.global_position - source.global_position
+	var face := source.global_position
+	face[facing.abs().max_axis_index()] += signs[facing.abs().max_axis_index()]
+	for feature in [["Vertex", vertex], ["Edge", edge], ["Face", face]]:
+		await _mouse_to(surface, camera.unproject_position(feature[1]))
+		_check(plugin._hover.get("kind") == feature[0], "CSG real hover " + feature[0])
+		var points: PackedVector3Array = plugin._hover.get("feature_points", PackedVector3Array())
+		var expected := 1 if feature[0] == "Vertex" else (2 if feature[0] == "Edge" else 6)
+		_check(points.size() == expected, "CSG highlight geometry " + feature[0])
+		await _capture("csg_" + String(feature[0]).to_lower())
+	await _mouse_to(surface, camera.unproject_position(vertex))
+	await _click(surface)
+	_check(plugin._has_base, "real click accepts CSG source")
+	await _mouse_to(surface, camera.unproject_position(target.global_position))
+	_check(plugin._target.get("node") == target, "real hover detects CSG target")
+	_check(plugin._display_base.is_equal_approx(plugin._target.get("position", Vector3.INF)), "CSG source reaches target exactly")
+	await _capture("csg_target")
+	await _click(surface)
+	_check(plugin._mode == 0, "CSG click commits")
+	var history: UndoRedo = plugin.get_undo_redo().get_history_undo_redo(plugin.get_undo_redo().get_object_history_id(source))
+	history.undo()
+	_check(source.position.is_equal_approx(Vector3(-2.5, 1, 0)), "CSG undo restores source")
+	# An in-flight deferred CSG rebuild must not revive a cancelled session.
+	_select([source])
+	plugin._begin(1, camera, camera.unproject_position(source.global_position))
+	plugin._start_base_pick()
+	plugin._cancel()
+	for i in 4:
+		await get_tree().process_frame
+	_check(plugin._mode == 0 and not plugin._building_snap, "cancel during CSG preparation stays cancelled")
+	# Restoring a moved boolean operand must finish evaluation before picking.
+	var cutter := CSGBox3D.new()
+	cutter.name = "CSG_Decoupe"
+	cutter.size = Vector3(0.8, 0.8, 4)
+	cutter.operation = CSGShape3D.OPERATION_SUBTRACTION
+	source.add_child(cutter)
+	cutter.owner = scene
+	for i in 3:
+		await get_tree().process_frame
+	_select([cutter])
+	plugin._begin(1, camera, camera.unproject_position(cutter.global_position))
+	plugin._handle_key(_key(KEY_X))
+	_type("1.5")
+	for i in 3:
+		await get_tree().process_frame
+	await plugin._start_base_pick()
+	_check(cutter.position.is_equal_approx(Vector3.ZERO), "B restores CSG operand before snapshot")
+	var probe := Camera3D.new()
+	camera.get_viewport().add_child(probe)
+	probe.global_position = source.global_position + Vector3(0, 0, 6)
+	var hole: Dictionary = plugin._source_picker.pick(probe, probe.unproject_position(source.global_position), 0.0)
+	_check(hole.is_empty(), "B sees restored boolean hole instead of stale preview")
+	probe.queue_free()
+	plugin._cancel()
+	plugin._panel_toggle.button_pressed = true
+	_select([])
+	source.queue_free()
+	target.queue_free()
+	cube.show()
+	other.show()
+	old_parent.show()
+
+
+func _capture(suffix: String) -> void:
+	if DisplayServer.get_name() == "headless" or not OS.has_environment("BC_CAPTURE_PATH"):
+		return
+	await RenderingServer.frame_post_draw
+	var path := OS.get_environment("BC_CAPTURE_PATH").get_basename() + "_" + suffix + ".png"
+	get_viewport().get_texture().get_image().save_png(path)
