@@ -1,0 +1,14 @@
+; Projet de démonstration Godot 4.7.2
+config_version=5
+
+[application]
+config/name="Blender Controls 3D — Démonstration"
+run/main_scene="res://demo.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+
+[editor_plugins]
+enabled=PackedStringArray("res://addons/blender_controls/plugin.cfg")

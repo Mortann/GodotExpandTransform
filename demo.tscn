@@ -1,0 +1,119 @@
+[gd_scene load_steps=12 format=3]
+
+[sub_resource type="StandardMaterial3D" id="Material_floor"]
+albedo_color = Color(0.075, 0.095, 0.14, 1)
+roughness = 0.88
+
+[sub_resource type="BoxMesh" id="Mesh_floor"]
+material = SubResource("Material_floor")
+size = Vector3(17, 0.2, 12)
+
+[sub_resource type="StandardMaterial3D" id="Material_coral"]
+albedo_color = Color(0.97, 0.29, 0.22, 1)
+roughness = 0.48
+
+[sub_resource type="BoxMesh" id="Mesh_coral"]
+material = SubResource("Material_coral")
+size = Vector3(1.8, 1.8, 1.8)
+
+[sub_resource type="StandardMaterial3D" id="Material_teal"]
+albedo_color = Color(0.06, 0.69, 0.66, 1)
+roughness = 0.42
+
+[sub_resource type="BoxMesh" id="Mesh_teal"]
+material = SubResource("Material_teal")
+size = Vector3(2.4, 2.8, 1.8)
+
+[sub_resource type="StandardMaterial3D" id="Material_gold"]
+albedo_color = Color(1, 0.67, 0.14, 1)
+roughness = 0.48
+
+[sub_resource type="BoxMesh" id="Mesh_gold"]
+material = SubResource("Material_gold")
+size = Vector3(1.5, 1.8, 1.5)
+
+[sub_resource type="ProceduralSkyMaterial" id="Sky_material"]
+sky_top_color = Color(0.13, 0.2, 0.34, 1)
+sky_horizon_color = Color(0.54, 0.65, 0.75, 1)
+ground_bottom_color = Color(0.12, 0.16, 0.22, 1)
+ground_horizon_color = Color(0.54, 0.65, 0.75, 1)
+
+[sub_resource type="Sky" id="Sky"]
+sky_material = SubResource("Sky_material")
+
+[sub_resource type="Environment" id="Environment"]
+background_mode = 2
+sky = SubResource("Sky")
+ambient_light_source = 3
+ambient_light_color = Color(0.72, 0.81, 1, 1)
+ambient_light_energy = 0.55
+reflected_light_source = 2
+tonemap_mode = 2
+
+[node name="BlenderControlsDemo" type="Node3D"]
+
+[node name="Sol_Verrouille" type="MeshInstance3D" parent="."]
+position = Vector3(0, -0.1, 0)
+mesh = SubResource("Mesh_floor")
+metadata/_edit_lock_ = true
+
+[node name="Cube_Corail" type="MeshInstance3D" parent="."]
+position = Vector3(-3.2, 0.9, 1)
+mesh = SubResource("Mesh_coral")
+
+[node name="Bloc_Turquoise" type="MeshInstance3D" parent="."]
+position = Vector3(0.3, 1.4, -1)
+rotation = Vector3(0, 0.3, 0)
+mesh = SubResource("Mesh_teal")
+
+[node name="Parent_Tourne_Echelle_Non_Uniforme" type="Node3D" parent="."]
+position = Vector3(3.8, 0, 1)
+rotation = Vector3(0, -0.5, 0)
+scale = Vector3(1.4, 0.8, 1.1)
+
+[node name="Enfant_Dore" type="MeshInstance3D" parent="Parent_Tourne_Echelle_Non_Uniforme"]
+position = Vector3(0, 1.2, 0)
+rotation = Vector3(0.12, 0.2, 0.05)
+mesh = SubResource("Mesh_gold")
+
+[node name="Titre" type="Label3D" parent="."]
+position = Vector3(0, 4.8, -2.5)
+billboard = 1
+modulate = Color(0.92, 0.96, 1, 1)
+font_size = 72
+outline_size = 8
+text = "BLENDER CONTROLS 3D"
+metadata/_edit_lock_ = true
+
+[node name="Raccourcis" type="Label3D" parent="."]
+position = Vector3(0, 4.15, -2.5)
+billboard = 1
+modulate = Color(0.64, 0.76, 0.87, 1)
+font_size = 40
+text = "G  déplacer   /   R  tourner   /   S  redimensionner\nB pendant la transformation : choisir une base d’accrochage"
+metadata/_edit_lock_ = true
+
+[node name="Camera3D" type="Camera3D" parent="."]
+position = Vector3(11, 8.5, 15)
+rotation = Vector3(-0.38, 0.63, 0)
+current = true
+fov = 50.0
+metadata/_edit_lock_ = true
+
+[node name="Lumiere_Principale" type="DirectionalLight3D" parent="."]
+rotation = Vector3(-0.95, -0.55, 0)
+light_color = Color(1, 0.93, 0.82, 1)
+light_energy = 1.6
+shadow_enabled = true
+directional_shadow_max_distance = 40.0
+metadata/_edit_lock_ = true
+
+[node name="Lumiere_Remplissage" type="DirectionalLight3D" parent="."]
+rotation = Vector3(-0.5, 2.4, 0)
+light_color = Color(0.58, 0.74, 1, 1)
+light_energy = 0.4
+metadata/_edit_lock_ = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment")
+metadata/_edit_lock_ = true
