@@ -170,8 +170,9 @@ func _run() -> void:
 	_check(not plugin._begin(1, camera, Vector2(200, 200)), "empty selection cannot start")
 	# Base selection against real mesh geometry; then all transform resolutions.
 	_start(1, [cube])
-	plugin._start_base_pick()
+	await plugin._start_base_pick()
 	_check(plugin._pick_base and cube.transform.is_equal_approx(original), "B restores reference pose")
+	camera.global_transform = scene.get_node("Camera3D").global_transform
 	var source := cube.global_transform * Vector3(0.9, 0.9, 0.9)
 	var target := other.global_transform * Vector3(1.2, 1.4, 0.9)
 	plugin._mouse = camera.unproject_position(source)
@@ -191,7 +192,7 @@ func _run() -> void:
 	_check(cube.transform.is_equal_approx(original), "B cancel restores initial pose")
 	for mode in [2, 3]:
 		_start(mode, [cube])
-		plugin._start_base_pick()
+		await plugin._start_base_pick()
 		plugin._hover = {"position": source, "normal": Vector3.UP, "kind": "Vertex", "node": cube}
 		plugin._accept_base()
 		plugin._motion(camera.unproject_position(target), false, false)
@@ -237,7 +238,8 @@ func _test_real_input() -> void:
 	await get_tree().process_frame
 	_check(plugin._mode == 1, "real input G starts modal")
 	Input.parse_input_event(_key(KEY_B))
-	await get_tree().process_frame
+	for i in 4:
+		await get_tree().process_frame
 	_check(plugin._pick_base, "real input B reaches addon before native snapping")
 	var release_b := _key(KEY_B)
 	release_b.pressed = false

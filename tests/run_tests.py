@@ -17,7 +17,7 @@ source = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="blender-controls-tests-") as scratch:
     root = Path(scratch)
     project = root / "project"
-    shutil.copytree(source, project, ignore=shutil.ignore_patterns(".godot", "__pycache__"))
+    shutil.copytree(source, project, ignore=shutil.ignore_patterns(".godot", ".git", "__pycache__"))
     env = dict(os.environ)
     for key, folder in [("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache")]:
         env[key] = str(root / folder)

@@ -1,12 +1,12 @@
 @tool
 extends RefCounted
-## Physics-independent snapping against a snapshot of MeshInstance3D geometry.
+## Physics-independent snapping against static meshes and rendered CSG results.
 ## Call rebuild after scene geometry/transforms change. Imported child meshes are
 ## included. Hidden branches and excluded roots are omitted. Locked objects can
 ## serve as read-only snap references. No triangle
 ## budget silently drops geometry; rebuilding a large scene can take time.
-## This uses mesh.get_faces(), so edges are triangle edges, and skeleton, blend
-## shape, shader deformation, CSG and MultiMesh geometry are outside its scope.
+## Adjacent coplanar triangles form one face; internal diagonals are not edges.
+## Skeleton, blend shape, shader deformation and MultiMesh are outside its scope.
 
 const CELL_SIZE := 32.0
 const EPSILON := 0.00001
@@ -44,7 +44,8 @@ func pick(camera: Camera3D, screen: Vector2, pixel_radius: float = 14.0) -> Dict
 			var distance := projected.distance_squared_to(screen)
 			if distance <= radius_squared:
 				vertices.append(_candidate(record, record.vertices[index],
-					record.normals[index], "Vertex", projected, distance))
+					record.normals[index], "Vertex", projected, distance,
+					PackedVector3Array([record.vertices[index]])))
 	var vertex_hit := _first_visible(camera, vertices)
 	if not vertex_hit.is_empty():
 		return vertex_hit
@@ -72,7 +73,8 @@ func pick(camera: Camera3D, screen: Vector2, pixel_radius: float = 14.0) -> Dict
 			var position := world_a.lerp(world_b, t)
 			var vertex_index: int = record.edges[index * 2]
 			edges.append(_candidate(record, position, record.normals[vertex_index],
-				"Edge", projected, distance))
+				"Edge", projected, distance, PackedVector3Array([
+					record.vertices[vertex_index], record.vertices[record.edges[index * 2 + 1]]])))
 	# Prefer a visible vertex, then an edge, then the surface directly under the
 	# pointer. Each feature gets its own occlusion ray, not the pointer's ray.
 	var edge_hit := _first_visible(camera, edges)
@@ -95,13 +97,26 @@ func _collect(node: Node, excluded_roots: Array[Node3D]) -> void:
 		if excluded_roots.has(node) or not node.is_visible_in_tree():
 			return
 	if node is MeshInstance3D and node.mesh != null:
-		_cache_mesh(node)
+		_cache_mesh(node, node.mesh)
+	elif node is CSGShape3D and node.is_root_shape():
+		var affected := false
+		for excluded in excluded_roots:
+			if node.is_ancestor_of(excluded):
+				affected = true
+				break
+		if not affected:
+			# The renderer exposes the evaluated boolean result on the CSG root.
+			# Do not cache each operand separately: subtraction interiors are not
+			# visible geometry, and moving a child changes the whole result.
+			var meshes: Array = node.get_meshes()
+			if meshes.size() >= 2 and meshes[1] is Mesh:
+				_cache_mesh(node, meshes[1])
 	for child in node.get_children():
 		_collect(child, excluded_roots)
 
 
-func _cache_mesh(node: MeshInstance3D) -> void:
-	var faces: PackedVector3Array = node.mesh.get_faces()
+func _cache_mesh(node: GeometryInstance3D, mesh: Mesh) -> void:
+	var faces: PackedVector3Array = mesh.get_faces()
 	if faces.size() < 3:
 		return
 	var world := node.global_transform
@@ -116,12 +131,19 @@ func _cache_mesh(node: MeshInstance3D) -> void:
 	var edges := PackedInt32Array()
 	var vertex_map: Dictionary = {}
 	var edge_map: Dictionary = {}
+	var face_normals := PackedVector3Array()
+	var parents: Array[int] = []
+	for index in range(faces.size() / 3):
+		parents.append(index)
+		face_normals.append(Vector3.ZERO)
 	var bounds := AABB(faces[0], Vector3.ZERO)
 	for triangle in range(0, faces.size() - 2, 3):
 		var a := faces[triangle]
 		var b := faces[triangle + 1]
 		var c := faces[triangle + 2]
 		var normal := (b - a).cross(c - a).normalized()
+		var face_index := triangle / 3
+		face_normals[face_index] = normal
 		if normal.length_squared() < EPSILON:
 			continue
 		var indices: Array[int] = []
@@ -137,20 +159,58 @@ func _cache_mesh(node: MeshInstance3D) -> void:
 			var second := indices[(corner + 1) % 3]
 			var edge_key := Vector2i(mini(first, second), maxi(first, second))
 			if not edge_map.has(edge_key):
-				edge_map[edge_key] = true
-				edges.append(first)
-				edges.append(second)
+				edge_map[edge_key] = []
+			edge_map[edge_key].append(face_index)
+	# Merge adjacent coplanar triangles into one visible face. In particular,
+	# a cube face must light up as a square, without snapping its hidden diagonal.
+	var boundary_edges: Dictionary = {}
+	for edge: Vector2i in edge_map:
+		var adjacent: Array = edge_map[edge]
+		if adjacent.size() == 2 and face_normals[adjacent[0]].dot(face_normals[adjacent[1]]) > 0.99999:
+			parents[_face_root(parents, adjacent[1])] = _face_root(parents, adjacent[0])
+		else:
+			boundary_edges[edge] = adjacent
+			edges.append(edge.x)
+			edges.append(edge.y)
+	var patches: Dictionary = {}
+	for index in parents.size():
+		var group := _face_root(parents, index)
+		parents[index] = group
+		if not patches.has(group):
+			patches[group] = {"points": [], "boundary": []}
+		for corner in 3:
+			patches[group].points.append(faces[index * 3 + corner])
+	for edge: Vector2i in boundary_edges:
+		var visited: Dictionary = {}
+		for index in boundary_edges[edge]:
+			var group: int = parents[index]
+			if visited.has(group):
+				continue
+			visited[group] = true
+			patches[group].boundary.append(vertices[edge.x])
+			patches[group].boundary.append(vertices[edge.y])
+	for group in patches:
+		patches[group].points = PackedVector3Array(patches[group].points)
+		patches[group].boundary = PackedVector3Array(patches[group].boundary)
 	_records.append({"node": node, "triangles": triangles, "bounds": bounds.grow(EPSILON),
+		"face_groups": parents, "patches": patches,
 		"vertices": vertices, "normals": normals, "edges": edges,
 		"vertex_grid": {}, "edge_grid": {}, "projected_vertices": PackedVector2Array(),
 		"projected_edges": PackedVector2Array(), "clipped_edges": PackedVector3Array()})
 	_triangle_count += faces.size() / 3
 
 
+static func _face_root(parents: Array[int], index: int) -> int:
+	while parents[index] != index:
+		parents[index] = parents[parents[index]]
+		index = parents[index]
+	return index
+
+
 func _record_visible(record: Dictionary, camera: Camera3D) -> bool:
 	if not is_instance_valid(record.node):
 		return false
-	var node: MeshInstance3D = record.node
+	var node: GeometryInstance3D = record.node
 	return node.is_inside_tree() and node.is_visible_in_tree() \
 		and (node.layers & camera.cull_mask) != 0
 
@@ -275,9 +335,9 @@ static func _query_grid(grid: Dictionary, point: Vector2, radius: float,
 
 
 static func _candidate(record: Dictionary, position: Vector3, normal: Vector3,
-		kind: String, screen: Vector2, distance: float) -> Dictionary:
+		kind: String, screen: Vector2, distance: float, points: PackedVector3Array) -> Dictionary:
 	return {"position": position, "normal": normal, "kind": kind,
-		"node": record.node, "screen": screen, "distance": distance}
+		"node": record.node, "screen": screen, "distance": distance, "feature_points": points}
 
 
 func _feature_visible(camera: Camera3D, candidate: Dictionary) -> bool:
@@ -308,8 +368,10 @@ func _raycast(camera: Camera3D, screen: Vector2) -> Dictionary:
 		var distance: float = origin.distance_squared_to(hit.position)
 		if distance < best_distance:
 			best_distance = distance
+			var patch: Dictionary = record.patches[record.face_groups[hit.face_index]]
 			best = {"position": hit.position, "normal": hit.normal,
-				"kind": "Face", "node": record.node}
+				"kind": "Face", "node": record.node,
+				"feature_points": patch.points, "boundary_points": patch.boundary}
 	return _public_hit(best, direction)
 
 
@@ -320,4 +382,6 @@ static func _public_hit(hit: Dictionary, ray_direction: Vector3) -> Dictionary:
 	if normal.dot(ray_direction) > 0.0:
 		normal = -normal
 	return {"position": hit.position, "normal": normal.normalized(),
-		"kind": hit.kind, "node": hit.node}
+		"kind": hit.kind, "node": hit.node,
+		"feature_points": hit.get("feature_points", PackedVector3Array([hit.position])),
+		"boundary_points": hit.get("boundary_points", PackedVector3Array())}

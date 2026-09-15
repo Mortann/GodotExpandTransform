@@ -29,6 +29,8 @@ func _run() -> void:
 	_test_exclusions()
 	_test_perspective_edge()
 	_test_clipping()
+	_test_highlight_geometry()
+	await _test_csg()
 	_test_large_mesh()
 	print("Snap picker: %d checks, %d failures" % [_checks, _failures])
 	_viewport.free()
@@ -163,6 +165,76 @@ func _test_large_mesh() -> void:
 	print("Dense mesh: %d triangles, rebuild + first pick %d ms, cached pick average %.1f ms" % [
 		expected, first_duration, float(Time.get_ticks_msec() - started) / 10.0])
 	node.free()
+
+
+func _test_highlight_geometry() -> void:
+	var node := _quad(0.0, 2.0)
+	var picker = Picker.new()
+	picker.rebuild(_scene)
+	var hit: Dictionary = picker.pick(_camera, _screen(Vector3.ZERO), 3.0)
+	_check(hit.kind == "Face", "coplanar triangulation diagonal is not a snap edge")
+	_check(hit.feature_points.size() == 6, "face highlight includes both triangles of quad")
+	_check(hit.boundary_points.size() == 8, "face highlight boundary contains four edges")
+	hit = picker.pick(_camera, _screen(Vector3(0, -2, 0)), 3.0)
+	_check(hit.kind == "Edge" and hit.feature_points.size() == 2, "edge highlight returns complete endpoints")
+	_check(hit.feature_points.has(Vector3(-2, -2, 0)) and hit.feature_points.has(Vector3(2, -2, 0)), "edge endpoints span the whole edge")
+	hit = picker.pick(_camera, _screen(Vector3(-2, -2, 0)), 3.0)
+	_check(hit.kind == "Vertex" and hit.feature_points.size() == 1, "vertex highlight returns one point")
+	node.free()
+
+
+func _test_csg() -> void:
+	var box := CSGBox3D.new()
+	box.size = Vector3(2, 2, 2)
+	_scene.add_child(box)
+	box.position = Vector3(1, 0, 0)
+	for i in 3:
+		await process_frame
+	var picker = Picker.new()
+	picker.rebuild(_scene)
+	_check(picker.get_statistics().meshes == 1, "standalone CSG box is cached")
+	var hit: Dictionary = picker.pick(_camera, _screen(Vector3(1, 0, 1)), 3.0)
+	_check(hit.get("kind") == "Face" and _position_near(hit, Vector3(1, 0, 1)), "CSG face snap has correct world transform")
+	_check(hit.get("feature_points", []).size() == 6, "CSG box face highlighted as whole square")
+	hit = picker.pick(_camera, _screen(Vector3(1, -1, 1)), 3.0)
+	_check(hit.get("kind") == "Edge", "CSG edge snaps")
+	hit = picker.pick(_camera, _screen(Vector3(2, -1, 1)), 3.0)
+	_check(hit.get("kind") == "Vertex", "CSG vertex snaps")
+	var exclusions: Array[Node3D] = [box]
+	picker.rebuild(_scene, exclusions)
+	_check(picker.get_statistics().meshes == 0, "moving CSG root is excluded from targets")
+	box.free()
+	# A through-hole proves the picker uses the rendered boolean result rather
+	# than overlapping source primitives (which would fill the hole back in).
+	var combiner := CSGCombiner3D.new()
+	_scene.add_child(combiner)
+	var solid := CSGBox3D.new()
+	solid.size = Vector3(4, 4, 2)
+	combiner.add_child(solid)
+	var cutter := CSGBox3D.new()
+	cutter.size = Vector3(1, 1, 4)
+	cutter.operation = CSGShape3D.OPERATION_SUBTRACTION
+	combiner.add_child(cutter)
+	for i in 3:
+		await process_frame
+	picker.rebuild(_scene)
+	_check(picker.get_statistics().meshes == 1, "CSG combiner cached once, without duplicate operands")
+	hit = picker.pick(_camera, _screen(Vector3.ZERO), 0.0)
+	_check(hit.is_empty(), "subtracted CSG hole stays empty")
+	hit = picker.pick(_camera, _screen(Vector3(1.5, 0, 1)), 0.0)
+	_check(not hit.is_empty() and hit.node == combiner, "remaining CSG surface remains snappable")
+	exclusions = [cutter]
+	picker.rebuild(_scene, exclusions)
+	_check(picker.get_statistics().meshes == 0, "moving CSG operand excludes dependent boolean result")
+	combiner.position = Vector3(-1, 0, -1)
+	combiner.rotation.y = 0.3
+	for i in 3:
+		await process_frame
+	picker.rebuild(_scene)
+	var target := combiner.global_transform * Vector3(1.5, 0, 1)
+	hit = picker.pick(_camera, _screen(target), 0.0)
+	_check(_position_near(hit, target), "CSG result follows translated and rotated root")
+	combiner.free()
 
 
 func _mesh(faces: PackedVector3Array) -> MeshInstance3D:

@@ -12,12 +12,14 @@ const AXIS_COLORS := [Color("f37878"), Color("86cf90"), Color("80afff")]
 
 var _mode: int = Mode.NONE
 var _enabled := true
+var _show_panel := true
 var _default_local := false
 var _local := false
 var _axis := -1
 var _plane := false
 var _axis_cycle := 0
 var _nodes: Array[Node3D] = []
+var _selection_snapshot := PackedInt64Array()
 var _original_local: Array[Transform3D] = []
 var _original_world: Array[Transform3D] = []
 var _parents: Array[Node] = []
@@ -38,6 +40,8 @@ var _number_valid := true
 var _value_text := ""
 var _error := ""
 var _pick_base := false
+var _building_snap := false
+var _snap_build_revision := 0
 var _has_base := false
 var _base := Vector3.ZERO
 var _display_base := Vector3.ZERO
@@ -49,6 +53,7 @@ var _last_operation := Transform3D.IDENTITY
 var _toolbar: HBoxContainer
 var _toggle: CheckButton
 var _orientation: OptionButton
+var _panel_toggle: Button
 var _help: AcceptDialog
 var _ignore_selection := false
 var _release_to_swallow := 0
@@ -59,6 +64,7 @@ func _enter_tree() -> void:
 	set_input_event_forwarding_always_enabled()
 	set_force_draw_over_forwarding_enabled()
 	set_process_input(true)
+	_show_panel = bool(EditorInterface.get_editor_settings().get_project_metadata("blender_controls", "show_panel", true))
 	_build_toolbar()
 	EditorInterface.get_selection().selection_changed.connect(_selection_changed)
 	scene_changed.connect(_scene_changed)
@@ -107,6 +113,14 @@ func _build_toolbar() -> void:
 		_default_local = index == 1
 	)
 	_toolbar.add_child(_orientation)
+	_panel_toggle = Button.new()
+	_panel_toggle.text = "Panneau"
+	_panel_toggle.toggle_mode = true
+	_panel_toggle.button_pressed = _show_panel
+	_panel_toggle.focus_mode = Control.FOCUS_NONE
+	_panel_toggle.tooltip_text = "Afficher ou masquer le panneau d’aide. Les surbrillances restent visibles."
+	_panel_toggle.toggled.connect(_set_panel_visible)
+	_toolbar.add_child(_panel_toggle)
 	var help_button := Button.new()
 	help_button.text = "?"
 	help_button.focus_mode = Control.FOCUS_NONE
@@ -131,9 +145,17 @@ func _build_toolbar() -> void:
 		+ "Vise ensuite la cible sur un autre objet et clique pour valider.\n"
 		+ "Ctrl suspend cet accrochage. B permet de choisir une nouvelle base.\n\n"
 		+ "Pivot : moyenne des origines. Axes Godot : Y est vertical.\n"
-		+ "Accrochage sur MeshInstance3D statiques, sans collision nécessaire.\n"
+		+ "Accrochage sur maillages statiques et formes CSG, sans collision.\n"
+		+ "Sommet : point lumineux • Arête : ligne • Face : surface teintée.\n"
+		+ "Le bouton Panneau masque l’aide sans masquer la surbrillance.\n"
 		+ "Le B natif de Godot reste disponible hors transformation.")
 	EditorInterface.get_base_control().add_child(_help)
+
+
+func _set_panel_visible(value: bool) -> void:
+	_show_panel = value
+	EditorInterface.get_editor_settings().set_project_metadata("blender_controls", "show_panel", value)
+	update_overlays()
 
 
 func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
@@ -149,6 +171,7 @@ func _forward_3d_gui_input(camera: Camera3D, event: InputEvent) -> int:
 		elif event is InputEventMouseMotion:
 			_motion(_to_camera(event.position), event.shift_pressed, event.ctrl_pressed)
 		elif event is InputEventMouseButton:
+			_motion(_to_camera(event.position), event.shift_pressed, event.ctrl_pressed)
 			_button(event)
 		return AFTER_GUI_INPUT_STOP
 	if event is InputEventKey and event.pressed and not event.echo:
@@ -188,6 +211,10 @@ func _input(event: InputEvent) -> void:
 		_handle_key(event)
 		get_viewport().set_input_as_handled()
 	elif event is InputEventMouse and is_instance_valid(_surface):
+		# The visibility option can be toggled during a transform without
+		# committing/cancelling it or forwarding the click as a scene click.
+		if is_instance_valid(_panel_toggle) and _panel_toggle.get_global_rect().has_point(event.position):
+			return
 		var local_pos: Vector2 = _surface.get_global_transform_with_canvas().affine_inverse() * event.position
 		if event is InputEventMouseMotion:
 			_motion(_to_camera(local_pos), event.shift_pressed, event.ctrl_pressed)
@@ -196,6 +223,7 @@ func _input(event: InputEvent) -> void:
 			if event.pressed and not Rect2(Vector2.ZERO, _surface.size).has_point(local_pos):
 				_cancel()
 				return
+			_motion(_to_camera(local_pos), event.shift_pressed, event.ctrl_pressed)
 			_button(event)
 		get_viewport().set_input_as_handled()
 
@@ -220,6 +248,7 @@ func _begin(mode: int, camera: Camera3D, mouse: Vector2) -> bool:
 	_parents.clear()
 	_parent_world.clear()
 	var selection := EditorInterface.get_selection()
+	_selection_snapshot = _selection_ids()
 	for selected in selection.get_top_selected_nodes():
 		if not selected is Node3D or not _editable(selected):
 			continue
@@ -401,7 +430,8 @@ func _motion(position: Vector2, shift: bool, ctrl: bool) -> void:
 	_effective_mouse += (position - _last_raw_mouse) * (0.1 if shift else 1.0)
 	_last_raw_mouse = position
 	if _pick_base:
-		_hover = _source_picker.pick(_camera, _mouse)
+		if not _building_snap:
+			_hover = _source_picker.pick(_camera, _mouse, _snap_radius())
 		update_overlays()
 	else:
 		_update_preview()
@@ -427,15 +457,31 @@ func _start_base_pick() -> void:
 	_number_valid = true
 	_error = ""
 	_pick_base = true
+	_building_snap = true
+	_snap_build_revision += 1
+	var revision := _snap_build_revision
+	_hover = {}
 	_target = {}
 	_last_operation = Transform3D.IDENTITY
 	_display_base = _base
+	update_overlays()
+	# CSG boolean meshes are deferred. After restoring a transformed operand,
+	# wait for evaluation instead of picking stale geometry from the preview.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	if revision != _snap_build_revision or _mode == Mode.NONE or not _context_valid():
+		return
 	_source_picker.rebuild(_scene)
-	_hover = _source_picker.pick(_camera, _mouse)
+	_building_snap = false
+	_hover = _source_picker.pick(_camera, _mouse, _snap_radius())
+	if _source_picker.get_statistics().meshes == 0:
+		_error = "Aucune géométrie détectée : utilise un maillage ou une forme CSG visible."
 	update_overlays()
 
 
 func _accept_base() -> void:
+	if _building_snap:
+		return
 	if _hover.is_empty():
 		_error = "Survole un sommet, une arête ou une face de maillage."
 		update_overlays()
@@ -467,7 +513,7 @@ func _update_preview() -> void:
 		return
 	_target = {}
 	if _has_base and not _ctrl and _number.is_empty():
-		_target = _picker.pick(_camera, _mouse)
+		_target = _picker.pick(_camera, _mouse, _snap_radius())
 	var operation := Transform3D.IDENTITY
 	match _mode:
 		Mode.MOVE:
@@ -591,6 +637,8 @@ func _cancel() -> void:
 func _finish() -> void:
 	_mode = Mode.NONE
 	_pick_base = false
+	_building_snap = false
+	_snap_build_revision += 1
 	_has_base = false
 	_nodes.clear()
 	_original_local.clear()
@@ -628,8 +676,18 @@ func _notification(what: int) -> void:
 
 
 func _selection_changed() -> void:
-	if not _ignore_selection:
+	# EditorSelection may emit its deferred notification after G has started.
+	# Ignore that notification if the selection itself is still unchanged.
+	if not _ignore_selection and _selection_ids() != _selection_snapshot:
 		_cancel()
+
+
+func _selection_ids() -> PackedInt64Array:
+	var ids := PackedInt64Array()
+	for node in EditorInterface.get_selection().get_selected_nodes():
+		ids.append(node.get_instance_id())
+	ids.sort()
+	return ids
 
 
 func _scene_changed(_root: Node) -> void:
@@ -664,9 +722,45 @@ func _project(point: Vector3) -> Vector2:
 	return _to_overlay(_camera.unproject_position(point))
 
 
+func _snap_radius() -> float:
+	# Detection uses camera pixels; keep its apparent radius constant when the
+	# editor UI is scaled or the viewport is rendered at reduced resolution.
+	var radius := 14.0 * EditorInterface.get_editor_scale()
+	return _to_camera(Vector2(radius, radius)).x
+
+
 func _forward_3d_force_draw_over_viewport(overlay: Control) -> void:
 	if _mode == Mode.NONE or not is_instance_valid(_camera) or overlay != _surface:
 		return
+	var ui_scale := EditorInterface.get_editor_scale()
+	if not _camera.is_position_behind(_pivot):
+		var center := _project(_pivot)
+		overlay.draw_arc(center, 5.0 * ui_scale, 0, TAU, 32, Color("f8f9fc"), 1.5, true)
+		if _axis >= 0:
+			var basis: Basis = Math3D.constraint_basis(_local, _active_basis)
+			for i in range(3):
+				if (_plane and i == _axis) or (not _plane and i != _axis):
+					continue
+				var direction := _project(_pivot + basis[i]) - center
+				if direction.length_squared() > 0.01:
+					direction = direction.normalized() * overlay.size.length()
+					overlay.draw_line(center - direction, center + direction, AXIS_COLORS[i] * Color(1, 1, 1, 0.6), 1.0, true)
+	if _has_base and not _camera.is_position_behind(_display_base):
+		_draw_marker(overlay, _display_base, Color("82e5dd"), false)
+	var pick: Dictionary = _hover if _pick_base else _target
+	if not pick.is_empty() and not _camera.is_position_behind(pick.position):
+		_draw_feature(overlay, pick)
+		_draw_marker(overlay, pick.position, Color("ffd37a"), true)
+		if _has_base and not _camera.is_position_behind(_display_base):
+			overlay.draw_dashed_line(_project(_display_base), _project(pick.position), Color("ffd37a"), 1.0, 5.0)
+
+	if _show_panel:
+		_draw_status_panel(overlay)
+	if _pick_base or _has_base:
+		_draw_snap_hint(overlay, pick)
+
+
+func _draw_status_panel(overlay: Control) -> void:
 	var ui_scale := EditorInterface.get_editor_scale()
 	var margin := 16.0 * ui_scale
 	var width := minf(overlay.size.x - margin * 2.0, 730.0 * ui_scale)
@@ -685,7 +779,7 @@ func _forward_3d_force_draw_over_viewport(overlay: Control) -> void:
 		title = "B · Choisir la base d’accrochage"
 	var value := "Saisie : " + _number if not _number.is_empty() else _value_text
 	if _pick_base:
-		value = "Survole un sommet, une arête ou une face, puis clique."
+		value = "Préparation de la géométrie…" if _building_snap else "Survole un sommet, une arête ou une face, puis clique."
 	elif _has_base:
 		value += "  |  Accrochage " + ("suspendu (Ctrl)" if _ctrl else "actif")
 	var detail := _error
@@ -700,25 +794,6 @@ func _forward_3d_force_draw_over_viewport(overlay: Control) -> void:
 	for i in range(lines.size()):
 		var color := Color("ffba8a") if i == 2 and not _error.is_empty() else Color("eef1f6")
 		overlay.draw_string(font, rect.position + Vector2(12.0 * ui_scale, line_height * (i + 1)), lines[i], HORIZONTAL_ALIGNMENT_LEFT, width - 24.0 * ui_scale, font_size, color)
-	if not _camera.is_position_behind(_pivot):
-		var center := _project(_pivot)
-		overlay.draw_arc(center, 5.0 * ui_scale, 0, TAU, 32, Color("f8f9fc"), 1.5, true)
-		if _axis >= 0:
-			var basis: Basis = Math3D.constraint_basis(_local, _active_basis)
-			for i in range(3):
-				if (_plane and i == _axis) or (not _plane and i != _axis):
-					continue
-				var direction := _project(_pivot + basis[i]) - center
-				if direction.length_squared() > 0.01:
-					direction = direction.normalized() * overlay.size.length()
-					overlay.draw_line(center - direction, center + direction, AXIS_COLORS[i] * Color(1, 1, 1, 0.6), 1.0, true)
-	if _has_base and not _camera.is_position_behind(_display_base):
-		_draw_marker(overlay, _display_base, Color("82e5dd"), false)
-	var pick: Dictionary = _hover if _pick_base else _target
-	if not pick.is_empty() and not _camera.is_position_behind(pick.position):
-		_draw_marker(overlay, pick.position, Color("ffd37a"), true)
-		if _has_base and not _camera.is_position_behind(_display_base):
-			overlay.draw_dashed_line(_project(_display_base), _project(pick.position), Color("ffd37a"), 1.0, 5.0)
 
 
 func _draw_marker(overlay: Control, position: Vector3, color: Color, square: bool) -> void:
@@ -730,6 +805,94 @@ func _draw_marker(overlay: Control, position: Vector3, color: Color, square: boo
 		overlay.draw_arc(center, radius, 0, TAU, 32, color, 2.0, true)
 	overlay.draw_line(center - Vector2(radius + 3, 0), center + Vector2(radius + 3, 0), color, 1.0, true)
 	overlay.draw_line(center - Vector2(0, radius + 3), center + Vector2(0, radius + 3), color, 1.0, true)
+
+
+func _draw_feature(overlay: Control, hit: Dictionary) -> void:
+	var points: PackedVector3Array = hit.get("feature_points", PackedVector3Array())
+	var color := Color("ffd37a")
+	var ui_scale := EditorInterface.get_editor_scale()
+	match String(hit.kind).to_lower():
+		"vertex":
+			var point := _project(hit.position)
+			overlay.draw_circle(point, 10.0 * ui_scale, Color(1, 0.67, 0.15, 0.22), true, -1, true)
+			overlay.draw_circle(point, 6.5 * ui_scale, Color("11151d"), true, -1, true)
+			overlay.draw_circle(point, 4.5 * ui_scale, color, true, -1, true)
+		"edge":
+			if points.size() == 2:
+				_draw_feature_edge(overlay, points[0], points[1], color, 3.5 * ui_scale)
+		"face":
+			for index in range(0, points.size() - 2, 3):
+				var polygon := _project_polygon(points.slice(index, index + 3))
+				if polygon.size() >= 3:
+					overlay.draw_colored_polygon(polygon, Color(1.0, 0.68, 0.18, 0.27))
+			var boundary: PackedVector3Array = hit.get("boundary_points", PackedVector3Array())
+			for index in range(0, boundary.size() - 1, 2):
+				_draw_feature_edge(overlay, boundary[index], boundary[index + 1], color, 2.0 * ui_scale)
+
+
+func _draw_feature_edge(overlay: Control, a: Vector3, b: Vector3, color: Color, width: float) -> void:
+	var inverse := _camera.get_camera_transform().affine_inverse()
+	var segment: PackedVector3Array = SnapPicker._clip_depth(a, b, -(inverse * a).z, -(inverse * b).z, _camera.near, _camera.far)
+	if segment.size() != 2:
+		return
+	var first := _project(segment[0])
+	var second := _project(segment[1])
+	overlay.draw_line(first, second, Color(0.04, 0.05, 0.08, 0.9), width + 3.0, true)
+	overlay.draw_line(first, second, color, width, true)
+
+
+func _project_polygon(world_points: PackedVector3Array) -> PackedVector2Array:
+	# Clip each triangle before projecting. Features straddling the camera's
+	# near plane must never produce inverted screen-filling highlight polygons.
+	var inverse := _camera.get_camera_transform().affine_inverse()
+	var points := world_points
+	for far_side in [false, true]:
+		if points.is_empty():
+			break
+		var clipped := PackedVector3Array()
+		var previous := points[-1]
+		var previous_depth := -(inverse * previous).z
+		var limit := _camera.far if far_side else _camera.near
+		var previous_inside := previous_depth <= limit if far_side else previous_depth >= limit
+		for point in points:
+			var depth := -(inverse * point).z
+			var inside := depth <= limit if far_side else depth >= limit
+			if inside != previous_inside:
+				clipped.append(previous.lerp(point, (limit - previous_depth) / (depth - previous_depth)))
+			if inside:
+				clipped.append(point)
+			previous = point
+			previous_depth = depth
+			previous_inside = inside
+		points = clipped
+	var result := PackedVector2Array()
+	for point in points:
+		result.append(_project(point))
+	return result
+
+
+func _draw_snap_hint(overlay: Control, hit: Dictionary) -> void:
+	var text := ""
+	if _building_snap:
+		text = "B · Préparation de la géométrie…"
+	elif _pick_base:
+		text = "1/2 · Choisir la base" if hit.is_empty() else "1/2 · " + _kind_name(hit.kind).capitalize() + " · Clic : choisir la base"
+	elif _ctrl:
+		text = "Accrochage suspendu · Relâche Ctrl"
+	else:
+		text = "2/2 · Viser la cible" if hit.is_empty() else "2/2 · " + _kind_name(hit.kind).capitalize() + " · Clic : valider"
+	if not _error.is_empty() and not _show_panel:
+		text = _error
+	var scale := EditorInterface.get_editor_scale()
+	var font := overlay.get_theme_default_font()
+	var font_size := int(14.0 * scale)
+	var width := minf(font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size).x + 20.0 * scale, overlay.size.x - 16.0)
+	var size := Vector2(width, 32.0 * scale)
+	var position := _to_overlay(_mouse) + Vector2(22.0, 25.0) * scale
+	position.x = clampf(position.x, 8.0, maxf(8.0, overlay.size.x - size.x - 8.0))
+	position.y = clampf(position.y, 8.0, maxf(8.0, overlay.size.y - size.y - 8.0))
+	overlay.draw_style_box(_panel_style(), Rect2(position, size))
+	overlay.draw_string(font, position + Vector2(10.0, 21.0) * scale, text, HORIZONTAL_ALIGNMENT_LEFT, width - 20.0 * scale, font_size, Color("ffd37a"))
 
 
 func _panel_style() -> StyleBoxFlat:
